@@ -198,7 +198,8 @@ public class DoclingFastServerClient implements HybridClient {
             throw new IOException("Empty response body");
         }
 
-        String responseStr = body.string();
+        byte[] bodyBytes = body.bytes();
+        String responseStr = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
         JsonNode root = objectMapper.readTree(responseStr);
 
         // Check for API error status

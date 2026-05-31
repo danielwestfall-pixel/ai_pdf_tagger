@@ -25,6 +25,7 @@ hybrid = [
 [project.scripts]
 opendataloader-pdf = "opendataloader_pdf.wrapper:main"
 opendataloader-pdf-hybrid = "opendataloader_pdf.hybrid_server:main"
+opendataloader-pdf-agent = "opendataloader_pdf.agent:main"
 
 [project.urls]
 Homepage = "https://github.com/opendataloader-project/opendataloader-pdf"

@@ -3,6 +3,7 @@ package org.opendataloader.pdf.processors;
 import org.opendataloader.pdf.autotagging.ChunksWriter;
 import org.opendataloader.pdf.autotagging.OperatorStreamKey;
 import org.opendataloader.pdf.entities.EnrichedImageChunk;
+import org.opendataloader.pdf.entities.SemanticPicture;
 import org.opendataloader.pdf.entities.SemanticFootnote;
 import org.opendataloader.pdf.entities.SemanticFormula;
 import org.opendataloader.pdf.exceptions.EncryptedTaggedPdfNotSupportedException;
@@ -696,6 +697,8 @@ public class AutoTaggingProcessor {
             createFormulaStructElem((SemanticFormula) object, parentStructElem, cosDocument);
         } else if (object instanceof ImageChunk) {
             createFigureStructElem((ImageChunk) object, parentStructElem, cosDocument);
+        } else if (object instanceof SemanticPicture) {
+            createFigureStructElem((SemanticPicture) object, parentStructElem, cosDocument);
         }
     }
 
@@ -798,6 +801,16 @@ public class AutoTaggingProcessor {
         processImageNode(image, figureObject);
         addCaptionIfPresent(image, figureObject, cosDocument);
         return figureObject;
+    }
+
+    private static void createFigureStructElem(SemanticPicture picture, COSObject parent, COSDocument cosDocument) {
+        COSObject figureObject = addStructElement(parent, cosDocument, TaggedPDFConstants.FIGURE, picture.getPageNumber());
+        double[] bbox = {picture.getLeftX(), picture.getBottomY(), picture.getRightX(), picture.getTopY()};
+        addAttributeToStructElem(figureObject, ASAtom.LAYOUT, ASAtom.BBOX, COSArray.construct(4, bbox));
+        
+        String altText = picture.sanitizeDescription();
+        setStringEntry(altText, figureObject, IMAGE_REPLACEMENT_TEXT, ASAtom.ALT, true);
+        cosDocument.addChangedObject(figureObject);
     }
 
 

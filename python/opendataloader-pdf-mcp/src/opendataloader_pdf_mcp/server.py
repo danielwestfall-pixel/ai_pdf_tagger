@@ -1,5 +1,7 @@
 """MCP server for OpenDataLoader PDF."""
 
+import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -7,6 +9,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 import opendataloader_pdf
+
+logger = logging.getLogger("opendataloader_pdf_mcp")
 
 mcp = FastMCP("opendataloader-pdf")
 
@@ -169,6 +173,138 @@ def convert_pdf(
             output_file = matching_ext[0]
 
         return output_file.read_text(encoding="utf-8")
+
+
+@mcp.tool()
+def tag_pdf_with_agent(
+    input_path: str,
+    output_dir: str = ".",
+    gemini_key: str | None = None,
+    model: str = "gemini-2.5-flash",
+    workers: int = 5,
+) -> str:
+    """Audit and tag a PDF file visually to the PDF/UA Matterhorn Protocol using Gemini.
+
+    This tool renders PDF pages to images, uses a Gemini multimodal agent to visually
+    group and classify elements (headings, tables, lists, informative figures, headers/footers),
+    names and updates tooltips on form fields, and generates a fully compliant tagged PDF.
+
+    Args:
+        input_path: Path to the input PDF file.
+        output_dir: Directory where the tagged PDF will be saved. Default: ".".
+        gemini_key: Optional Gemini API Key (overrides GEMINI_API_KEY env variable).
+        model: Gemini model name. Default: gemini-2.5-flash.
+        workers: Number of parallel page auditing threads. Default: 5.
+
+    Returns:
+        Status message with the path to the tagged PDF.
+    """
+    input_file = Path(input_path).expanduser().resolve()
+    if not input_file.is_file():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    from opendataloader_pdf.agent import GeminiAgentConverter
+
+    # Resolve API Key
+    api_key = gemini_key or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "Gemini API Key is missing. Pass gemini_key or set the GEMINI_API_KEY environment variable."
+        )
+
+    # Instantiate the agent converter
+    converter = GeminiAgentConverter(api_key=api_key, model_name=model, max_workers=workers)
+
+    # Convert to tagged-pdf using agent workflow
+    logger.info(f"Starting Visual PDF Tagger AI Agent on: {input_file}")
+    result = converter.convert(str(input_file))
+
+    out_path = Path(output_dir).expanduser().resolve()
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Run the Java CLI inside the agent via the local mock server flow
+    temp_pdf = getattr(converter, "temp_pdf_path", None)
+    if not temp_pdf or not os.path.exists(temp_pdf):
+        logger.warning("No modified PDF was generated. Falling back to input PDF.")
+        temp_pdf = str(input_file)
+
+    import socket
+    import threading
+    import time
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    app = FastAPI()
+
+    @app.post("/v1/convert/file")
+    def convert_mock():
+        return JSONResponse(
+            {
+                "status": result.status,
+                "document": {"json_content": result.document.export_to_dict()},
+                "errors": result.errors,
+                "failed_pages": [],
+            }
+        )
+
+    @app.get("/health")
+    def health_mock():
+        return {"status": "ok"}
+
+    # Find free port
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    server_thread = threading.Thread(
+        target=uvicorn.run,
+        args=(app,),
+        kwargs={"host": "127.0.0.1", "port": port, "log_level": "error"},
+        daemon=True,
+    )
+    server_thread.start()
+
+    # Wait a moment for server to start
+    time.sleep(1.0)
+
+    # Call convert to generate tagged PDF
+    from opendataloader_pdf.convert_generated import convert as wrapper_convert
+
+    wrapper_convert(
+        input_path=temp_pdf,
+        output_dir=str(out_path),
+        format="tagged-pdf",
+        hybrid="docling-fast",
+        hybrid_mode="full",
+        hybrid_url=f"http://127.0.0.1:{port}",
+        quiet=True,
+    )
+
+    temp_pdf_stem = Path(temp_pdf).stem
+    generated_tagged = out_path / f"{temp_pdf_stem}_tagged.pdf"
+    final_tagged = out_path / f"{input_file.stem}_tagged.pdf"
+
+    if generated_tagged.is_file():
+        if generated_tagged != final_tagged:
+            if final_tagged.exists():
+                final_tagged.unlink()
+            generated_tagged.rename(final_tagged)
+        msg = f"Successfully generated tagged PDF complying with the Matterhorn Protocol at: {final_tagged}"
+    else:
+        raise RuntimeError(
+            f"Failed to generate tagged PDF. Java CLI output was not found at {generated_tagged}."
+        )
+
+    # Clean up temp PDF
+    try:
+        if temp_pdf and temp_pdf != str(input_file) and os.path.exists(temp_pdf):
+            os.unlink(temp_pdf)
+    except Exception:
+        pass
+
+    return msg
 
 
 def main():

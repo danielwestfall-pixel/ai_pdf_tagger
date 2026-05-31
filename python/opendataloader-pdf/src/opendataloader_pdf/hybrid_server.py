@@ -62,6 +62,9 @@ import asyncio
 import logging
 import os
 import re
+
+from dotenv import load_dotenv
+load_dotenv()
 import sys
 import tempfile
 import threading
@@ -523,6 +526,8 @@ def create_app(
     picture_description_prompt: str | None = None,
     max_file_size: int = MAX_FILE_SIZE,
     device: str = "auto",
+    use_gemini_agent: bool = False,
+    gemini_model: str = "gemini-2.5-flash",
 ):
     """Create and configure the FastAPI application.
 
@@ -537,47 +542,62 @@ def create_app(
         picture_description_prompt: Custom prompt forwarded to the VLM. If None or blank/whitespace-only, docling's default prompt is used.
         max_file_size: Maximum file size in bytes. 0 means no limit (default).
         device: Accelerator device for model inference ("auto", "cpu", "cuda", "mps", "xpu").
+        use_gemini_agent: Use Gemini multimodal agent for visual tagging.
+        gemini_model: Gemini model name for the agent.
     """
-    from fastapi import FastAPI, File, Form, UploadFile
-    from fastapi.responses import JSONResponse
+    from fastapi import FastAPI, File, Form, UploadFile, Request, BackgroundTasks
+    from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+    from pathlib import Path
+    import uuid
+    import subprocess
+    import sys
 
     # Profile converters: initialized lazily on first /v1/profile/file request
     profile_converters: dict[str, Any] = {}
+
+    _docling_converter = None
+    _gemini_converter = None
+    _converter_lock = threading.Lock()
+
+    def get_docling_converter():
+        nonlocal _docling_converter
+        with _converter_lock:
+            if _docling_converter is None:
+                logger.info("Initializing Docling DocumentConverter...")
+                _docling_converter = create_converter(
+                    force_full_page_ocr=force_ocr,
+                    disable_ocr=disable_ocr,
+                    ocr_engine=ocr_engine,
+                    psm=psm,
+                    ocr_lang=ocr_lang,
+                    enrich_formula=enrich_formula,
+                    enrich_picture_description=enrich_picture_description,
+                    picture_description_prompt=picture_description_prompt,
+                    device=device,
+                )
+            return _docling_converter
+
+    def get_gemini_converter():
+        nonlocal _gemini_converter
+        with _converter_lock:
+            if _gemini_converter is None:
+                logger.info(f"Initializing GeminiAgentConverter (model={gemini_model})...")
+                from .agent import GeminiAgentConverter
+                _gemini_converter = GeminiAgentConverter(model_name=gemini_model)
+            return _gemini_converter
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         """Lifespan context manager for startup and shutdown events."""
         global converter
-        lang_str = ",".join(ocr_lang) if ocr_lang else "default"
-        enrichments = []
-        if enrich_formula:
-            enrichments.append("formula")
-        if enrich_picture_description:
-            enrichments.append("picture-description")
-        enrichment_str = ",".join(enrichments) if enrichments else "none"
-        logger.info(
-            f"Initializing DocumentConverter "
-            f"(do_ocr={not disable_ocr}, ocr_engine={ocr_engine}, force_ocr={force_ocr}, "
-            f"lang={lang_str}, enrichments={enrichment_str}, device={device})..."
-        )
         start = time.perf_counter()
-
-        converter = create_converter(
-            force_full_page_ocr=force_ocr,
-            disable_ocr=disable_ocr,
-            ocr_engine=ocr_engine,
-            psm=psm,
-            ocr_lang=ocr_lang,
-            enrich_formula=enrich_formula,
-            enrich_picture_description=enrich_picture_description,
-            picture_description_prompt=picture_description_prompt,
-            device=device,
-        )
-
+        if use_gemini_agent:
+            converter = get_gemini_converter()
+        else:
+            converter = get_docling_converter()
         elapsed = time.perf_counter() - start
-        logger.info(f"DocumentConverter initialized in {elapsed:.2f}s")
+        logger.info(f"Converter pre-initialized in {elapsed:.2f}s")
         yield
-        # Cleanup on shutdown (if needed)
 
     app = FastAPI(
         title="Docling Fast Server",
@@ -586,33 +606,14 @@ def create_app(
         lifespan=lifespan,
     )
 
-    @app.get("/health")
-    def health():
-        """Health check endpoint."""
-        return {"status": "ok"}
+    # In-memory storage for web agent tagging tasks
+    tasks: dict[str, dict] = {}
+    WEB_WORK_DIR = Path(tempfile.gettempdir()) / "opendataloader_web"
 
-    @app.post("/v1/convert/file")
-    async def convert_file(
-        files: UploadFile = File(...),
-        page_ranges: Optional[str] = Form(default=None),
-    ):
-        """Convert PDF file to JSON (DoclingDocument format).
-
-        Only JSON output is provided - markdown and HTML are generated by
-        Java processors for consistent reading order application.
-
-        Args:
-            files: The PDF file to convert
-            page_ranges: Page range string "start-end" (e.g., "1-5") (optional)
-
-        Returns:
-            JSON response with document content.
-        """
-        global converter
-
-        if converter is None:
+    async def _process_conversion(converter_instance, files: UploadFile, page_ranges: Optional[str]):
+        if converter_instance is None:
             return JSONResponse(
-                {"status": "failure", "errors": ["Server not initialized"]},
+                {"status": "failure", "errors": ["Converter not initialized"]},
                 status_code=503,
             )
 
@@ -653,9 +654,9 @@ def create_app(
                 with _convert_lock:
                     t0 = time.perf_counter()
                     if page_range_tuple:
-                        res = converter.convert(tmp_path, page_range=page_range_tuple)
+                        res = converter_instance.convert(tmp_path, page_range=page_range_tuple)
                     else:
-                        res = converter.convert(tmp_path)
+                        res = converter_instance.convert(tmp_path)
                     return res, time.perf_counter() - t0
 
             result, processing_time = await asyncio.to_thread(_do_convert)
@@ -709,6 +710,455 @@ def create_app(
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+    # Web UI Routes
+    @app.get("/", response_class=HTMLResponse)
+    async def get_index():
+        from .web_ui import HTML_CONTENT
+        return HTMLResponse(content=HTML_CONTENT)
+
+    @app.get("/v1/agent/config")
+    async def get_config():
+        return {
+            "default_model": gemini_model,
+            "has_key": bool(os.environ.get("GEMINI_API_KEY")),
+            "current_mode_agent": use_gemini_agent
+        }
+
+    def run_tagging_task_thread(
+        task_id: str,
+        input_path: str,
+        engine: str,
+        model: str,
+        page_ranges: Optional[str],
+        host_url: str,
+        custom_api_key: Optional[str],
+        language: Optional[str] = None,
+        title: Optional[str] = None,
+        enrich_picture_description: bool = False
+    ):
+        try:
+            tasks[task_id]["status"] = "running"
+            tasks[task_id]["progress"] = 10
+            tasks[task_id]["logs"].append(f"INFO - Starting PDF Tagging Pipeline with engine: {engine}")
+
+            web_work_dir = Path(tempfile.gettempdir()) / "opendataloader_web"
+            web_work_dir.mkdir(parents=True, exist_ok=True)
+            input_stem = Path(input_path).stem
+
+            if engine == "gemini":
+                tasks[task_id]["logs"].append("INFO - Initializing Gemini Multimodal Agent...")
+                tasks[task_id]["progress"] = 15
+
+                # 1. Run Gemini converter to audit layout and write form fields
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter_instance = GeminiAgentConverter(api_key=custom_api_key, model_name=model)
+
+                page_range_tuple = None
+                if page_ranges:
+                    try:
+                        parts = page_ranges.split("-")
+                        if len(parts) == 2:
+                            page_range_tuple = (int(parts[0]), int(parts[1]))
+                    except Exception:
+                        pass
+
+                tasks[task_id]["logs"].append("INFO - Analyzing visual layout and tagging form fields (Gemini)...")
+                tasks[task_id]["progress"] = 25
+
+                import logging
+                agent_logger = logging.getLogger("pdf_tagger_agent")
+
+                class TaskLogHandler(logging.Handler):
+                    def emit(self, record):
+                        log_msg = self.format(record)
+                        tasks[task_id]["logs"].append(log_msg)
+
+                handler = TaskLogHandler()
+                handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
+                agent_logger.addHandler(handler)
+
+                def progress_cb(completed, total):
+                    page_progress = 25 + int((completed / total) * 43)
+                    tasks[task_id]["progress"] = page_progress
+                    tasks[task_id]["logs"].append(f"INFO - Page progress: {completed} of {total} completed.")
+
+                try:
+                    result = converter_instance.convert(input_path, page_range=page_range_tuple, progress_callback=progress_cb)
+                finally:
+                    agent_logger.removeHandler(handler)
+
+                if result.status == "failure":
+                    errors_str = ", ".join(result.errors)
+                    raise Exception(f"Visual layout analysis failed: {errors_str}")
+
+                temp_pdf_path = getattr(converter_instance, "temp_pdf_path", None)
+                if not temp_pdf_path or not os.path.exists(temp_pdf_path):
+                    raise Exception("Failed to generate modified PDF with updated form fields.")
+
+                tasks[task_id]["layout_json"] = result.document.export_to_dict()
+                tasks[task_id]["progress"] = 70
+                tasks[task_id]["logs"].append("INFO - Invoking Java tagging engine to compile accessibility tags into PDF...")
+
+                hybrid_url = f"{host_url}/v1/agent/callback/{task_id}"
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "opendataloader_pdf.wrapper",
+                    temp_pdf_path,
+                    "--format", "tagged-pdf",
+                    "--output-dir", str(web_work_dir),
+                    "--hybrid", "docling-fast",
+                    "--hybrid-mode", "full",
+                    "--hybrid-url", hybrid_url,
+                ]
+            else:
+                tasks[task_id]["logs"].append("INFO - Running Docling Fast Layout Engine...")
+                tasks[task_id]["progress"] = 25
+                hybrid_url = f"{host_url}/docling"
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "opendataloader_pdf.wrapper",
+                    input_path,
+                    "--format", "tagged-pdf",
+                    "--output-dir", str(web_work_dir),
+                    "--hybrid", "docling-fast",
+                    "--hybrid-mode", "full",
+                    "--hybrid-url", hybrid_url,
+                ]
+                if page_ranges:
+                    cmd.extend(["--pages", page_ranges])
+                
+                if enrich_picture_description:
+                    hybrid_url = f"{host_url}/docling/picture"
+                    cmd[cmd.index("--hybrid-url") + 1] = hybrid_url
+
+            tasks[task_id]["logs"].append(f"INFO - Executing subprocess: {' '.join(cmd)}")
+
+            sub_env = os.environ.copy()
+            if custom_api_key:
+                sub_env["GEMINI_API_KEY"] = custom_api_key
+            # Pass document language and title to Java via environment variables
+            # These are used by AutoTaggingProcessor to set PDF/UA metadata
+            if language and language.strip():
+                sub_env["ODL_PDF_LANG"] = language.strip()
+            if title and title.strip():
+                sub_env["ODL_PDF_TITLE"] = title.strip()
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=sub_env
+            )
+
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    line_str = line.strip()
+                    tasks[task_id]["logs"].append(line_str)
+                    if "Compiling PDF/UA structure tree" in line_str or "Parsing layout" in line_str:
+                        tasks[task_id]["progress"] = 85
+                    elif "Successfully generated tagged PDF" in line_str:
+                        tasks[task_id]["progress"] = 95
+
+            return_code = process.wait()
+
+            if engine == "gemini" and temp_pdf_path and os.path.exists(temp_pdf_path):
+                try:
+                    os.unlink(temp_pdf_path)
+                except Exception:
+                    pass
+
+            if return_code == 0:
+                if engine == "gemini":
+                    temp_stem = Path(temp_pdf_path).stem
+                    generated_output = web_work_dir / f"{temp_stem}_tagged.pdf"
+                else:
+                    generated_output = web_work_dir / f"{input_stem}_tagged.pdf"
+
+                final_output = web_work_dir / f"{input_stem}_tagged.pdf"
+
+                if generated_output.exists():
+                    if generated_output != final_output:
+                        if final_output.exists():
+                            final_output.unlink()
+                        generated_output.rename(final_output)
+                    tasks[task_id]["status"] = "completed"
+                    tasks[task_id]["progress"] = 100
+                    tasks[task_id]["output_file"] = str(final_output)
+                    tasks[task_id]["logs"].append("SUCCESS - PDF tagging completed successfully. Ready for download.")
+                else:
+                    raise Exception(f"Output tagged PDF file not found at {generated_output}.")
+            else:
+                raise Exception(f"Tagging process exited with code {return_code}")
+
+        except Exception as e:
+            tasks[task_id]["status"] = "failed"
+            tasks[task_id]["error"] = str(e)
+            tasks[task_id]["logs"].append(f"ERROR - Tagging failed: {str(e)}")
+            logger.error(f"Task {task_id} failed: {e}", exc_info=True)
+        finally:
+            if input_path and os.path.exists(input_path):
+                try:
+                    os.unlink(input_path)
+                except Exception:
+                    pass
+
+    @app.post("/v1/agent/tag")
+    async def tag_pdf(
+        background_tasks: BackgroundTasks,
+        request: Request,
+        file: UploadFile = File(...),
+        engine: str = Form("gemini"),
+        model: str = Form("gemini-2.5-flash"),
+        pages: Optional[str] = Form(default=None),
+        api_key: Optional[str] = Form(default=None),
+        language: Optional[str] = Form(default=None),
+        title: Optional[str] = Form(default=None),
+        enrich_picture_description: Optional[str] = Form(default=None)
+    ):
+        task_id = f"tag_{uuid.uuid4().hex[:8]}"
+        web_work_dir = Path(tempfile.gettempdir()) / "opendataloader_web"
+        web_work_dir.mkdir(parents=True, exist_ok=True)
+        
+        input_path = web_work_dir / f"{task_id}_input.pdf"
+        
+        # Stream file to disk
+        with open(input_path, "wb") as f:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                f.write(chunk)
+                
+        # Initialize task info
+        tasks[task_id] = {
+            "status": "pending",
+            "progress": 0,
+            "logs": [],
+            "error": None,
+            "output_file": None,
+            "layout_json": None,
+            "original_filename": file.filename
+        }
+        
+        # Get base URL of current server (e.g. http://127.0.0.1:5002)
+        base_url = str(request.base_url).rstrip('/')
+        
+        # If the host is 0.0.0.0, replace it with 127.0.0.1 for local callback
+        if "0.0.0.0" in base_url:
+            base_url = base_url.replace("0.0.0.0", "127.0.0.1")
+            
+        # Run tagging in the background
+        background_tasks.add_task(
+            run_tagging_task_thread,
+            task_id=task_id,
+            input_path=str(input_path),
+            engine=engine,
+            model=model,
+            page_ranges=pages,
+            host_url=base_url,
+            custom_api_key=api_key,
+            language=language,
+            title=title,
+            enrich_picture_description=(enrich_picture_description == "true")
+        )
+        
+        return {"task_id": task_id, "status": "pending"}
+
+    @app.get("/v1/agent/tasks/{task_id}/status")
+    async def get_task_status(task_id: str, since: int = 0):
+        if task_id not in tasks:
+            return JSONResponse({"detail": "Task not found"}, status_code=404)
+            
+        task = tasks[task_id]
+        logs = task["logs"][since:]
+        
+        return {
+            "status": task["status"],
+            "progress": task["progress"],
+            "logs": logs,
+            "error": task["error"],
+            "output_url": f"/v1/agent/tasks/{task_id}/download" if task["status"] == "completed" else None
+        }
+
+    @app.get("/v1/agent/tasks/{task_id}/download")
+    async def download_task_output(task_id: str):
+        if task_id not in tasks:
+            return JSONResponse({"detail": "Task not found"}, status_code=404)
+            
+        task = tasks[task_id]
+        if task["status"] != "completed" or not task["output_file"]:
+            return JSONResponse({"detail": "Task not completed or file not found"}, status_code=400)
+            
+        output_path = Path(task["output_file"])
+        if not output_path.exists():
+            return JSONResponse({"detail": "File not found on disk"}, status_code=404)
+            
+        original_name = task.get("original_filename", "document.pdf")
+        download_name = original_name.replace(".pdf", "_tagged.pdf") if original_name.endswith(".pdf") else f"{original_name}_tagged.pdf"
+
+        return FileResponse(
+            path=output_path,
+            filename=download_name,
+            media_type="application/pdf"
+        )
+
+    @app.get("/v1/agent/callback/{task_id}/health")
+    async def callback_health(task_id: str):
+        if task_id not in tasks:
+            return JSONResponse({"status": "failure", "errors": ["Task not found"]}, status_code=404)
+        return {"status": "ok"}
+
+    @app.post("/v1/agent/callback/{task_id}/v1/convert/file")
+    async def agent_callback(task_id: str):
+        if task_id not in tasks:
+            return JSONResponse({"status": "failure", "errors": ["Task not found"]}, status_code=404)
+            
+        layout_json = tasks[task_id].get("layout_json")
+        if not layout_json:
+            return JSONResponse({"status": "failure", "errors": ["Layout JSON not ready"]}, status_code=400)
+            
+        return JSONResponse({
+            "status": "success",
+            "document": {"json_content": layout_json},
+            "errors": [],
+            "failed_pages": []
+        })
+
+    # Standard endpoints
+    @app.get("/health")
+    @app.get("/docling/health")
+    @app.get("/docling/picture/health")
+    def health():
+        """Health check endpoint."""
+        return {"status": "ok"}
+
+    @app.post("/v1/convert/file")
+    async def convert_file(
+        files: UploadFile = File(...),
+        page_ranges: Optional[str] = Form(default=None),
+    ):
+        """Convert PDF file to JSON (DoclingDocument format)."""
+        conv = get_gemini_converter() if use_gemini_agent else get_docling_converter()
+        return await _process_conversion(conv, files, page_ranges)
+
+    @app.post("/gemini/v1/convert/file")
+    async def convert_file_gemini(
+        files: UploadFile = File(...),
+        page_ranges: Optional[str] = Form(default=None),
+    ):
+        """Convert PDF file to JSON using Gemini Visual AI Agent."""
+        conv = get_gemini_converter()
+        return await _process_conversion(conv, files, page_ranges)
+
+    @app.post("/docling/v1/convert/file")
+    async def convert_file_docling(
+        files: UploadFile = File(...),
+        page_ranges: Optional[str] = Form(default=None),
+    ):
+        """Convert PDF file to JSON using Docling Fast Layout Engine."""
+        conv = get_docling_converter()
+        return await _process_conversion(conv, files, page_ranges)
+
+    @app.post("/docling/picture/v1/convert/file")
+    async def convert_file_docling_picture(
+        files: UploadFile = File(...),
+        page_ranges: Optional[str] = Form(default=None),
+    ):
+        """Convert PDF file to JSON using Docling with Picture Descriptions enabled."""
+        _ensure_profile_converters()
+        conv = profile_converters["picture"]
+        
+        file_bytes = await files.read()
+        import io
+        files = UploadFile(filename=files.filename, file=io.BytesIO(file_bytes))
+        
+        res = await _process_conversion(conv, files, page_ranges)
+        
+        if res.status_code == 200:
+            import json
+            import fitz
+            import base64
+            import requests
+            
+            body = json.loads(res.body.decode('utf-8'))
+            json_content = body.get("document", {}).get("json_content", {})
+            pictures = json_content.get("pictures", [])
+            
+            if pictures:
+                try:
+                    doc = fitz.open("pdf", file_bytes)
+                    from opendataloader_pdf.agent import GeminiAgentConverter
+                    agent = get_gemini_converter()
+                    
+                    for pic in pictures:
+                        prov = pic.get("prov", [])
+                        if not prov:
+                            continue
+                        
+                        bbox = prov[0].get("bbox", {})
+                        if not bbox:
+                            continue
+                            
+                        page_no = prov[0].get("page_no", 1) - 1
+                        if page_no < 0 or page_no >= len(doc):
+                            continue
+                            
+                        page = doc[page_no]
+                        page_h = page.rect.height
+                        
+                        # Docling coord_origin is usually BOTTOMLEFT, but sometimes it is TOPLEFT
+                        origin = bbox.get("coord_origin", "BOTTOMLEFT")
+                        l, t, r, b = bbox["l"], bbox["t"], bbox["r"], bbox["b"]
+                        
+                        if origin == "BOTTOMLEFT":
+                            t_fitz = page_h - t
+                            b_fitz = page_h - b
+                        else:
+                            t_fitz = t
+                            b_fitz = b
+                            
+                        rect = fitz.Rect(min(l, r), min(t_fitz, b_fitz), max(l, r), max(t_fitz, b_fitz))
+                        pix = page.get_pixmap(clip=rect, dpi=150)
+                        img_bytes = pix.tobytes("png")
+                        
+                        b64 = base64.b64encode(img_bytes).decode("utf-8")
+                        
+                        payload = {
+                            "contents": [{
+                                "parts": [
+                                    {"text": picture_description_prompt or "Describe this image for a visually impaired user. Be extremely detailed. Only output the description text."},
+                                    {"inlineData": {"mimeType": "image/png", "data": b64}}
+                                ]
+                            }]
+                        }
+                        
+                        try:
+                            gem_res = agent._call_gemini_api_with_retry(payload)
+                            text = gem_res.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                            if text:
+                                pic["annotations"] = [{"kind": "description", "text": text}]
+                                logger.info(f"Gemini successfully described picture on page {page_no + 1}")
+                        except Exception as e:
+                            logger.error(f"Gemini description failed: {e}")
+                            
+                    doc.close()
+                    # Re-encode body
+                    res = JSONResponse(body)
+                except Exception as e:
+                    logger.error(f"Error enriching docling pictures with Gemini: {e}")
+                    
+        return res
 
     def _ensure_profile_converters():
         """Lazily initialize profile converters on first use."""
@@ -925,6 +1375,18 @@ def main():
         choices=["auto", "cpu", "cuda", "mps", "xpu"],
         help="Accelerator device for model inference: auto (default), cpu, cuda, mps (Apple Silicon), xpu (Intel GPU).",
     )
+    parser.add_argument(
+        "--use-gemini-agent",
+        action="store_true",
+        default=False,
+        help="Use Gemini multimodal agent for visual layout tagging instead of Docling.",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        type=str,
+        default="gemini-2.5-flash",
+        help="Gemini model name to use for the visual tagger agent. Default: gemini-2.5-flash.",
+    )
     args = parser.parse_args()
 
     # Parse ocr_lang
@@ -960,7 +1422,7 @@ def main():
     # Probe engine availability at startup (only when OCR is on). A missing
     # `tesseract` binary or Python package surfaces here as a clear, actionable
     # error rather than as a deferred runtime exception during the first request.
-    if not args.no_ocr:
+    if not args.no_ocr and not args.use_gemini_agent:
         ok, err = _check_ocr_engine_available(args.ocr_engine)
         if not ok:
             logger.error(err)
@@ -994,17 +1456,20 @@ def main():
     # Convert MB to bytes (0 stays 0 = unlimited)
     max_file_size_bytes = args.max_file_size * 1024 * 1024 if args.max_file_size > 0 else 0
 
-    logger.info(f"Starting Docling Fast Server on http://{args.host}:{args.port}")
-    psm_str = f", psm={args.psm}" if args.psm is not None else ""
-    logger.info(
-        f"OCR settings: do_ocr={not args.no_ocr}, ocr_engine={args.ocr_engine}, "
-        f"force_ocr={args.force_ocr}, lang={ocr_lang or 'default'}{psm_str}"
-    )
+    if args.use_gemini_agent:
+        logger.info(f"Starting Gemini Agent Tagging Server on http://{args.host}:{args.port}")
+    else:
+        logger.info(f"Starting Docling Fast Server on http://{args.host}:{args.port}")
+        psm_str = f", psm={args.psm}" if args.psm is not None else ""
+        logger.info(
+            f"OCR settings: do_ocr={not args.no_ocr}, ocr_engine={args.ocr_engine}, "
+            f"force_ocr={args.force_ocr}, lang={ocr_lang or 'default'}{psm_str}"
+        )
     if max_file_size_bytes > 0:
         logger.info(f"Max file size: {args.max_file_size}MB")
     else:
         logger.info("Max file size: unlimited")
-    if enrichments:
+    if enrichments and not args.use_gemini_agent:
         logger.info(f"Enrichments enabled: {', '.join(enrichments)}")
 
     app = create_app(
@@ -1018,6 +1483,8 @@ def main():
         picture_description_prompt=args.picture_description_prompt,
         max_file_size=max_file_size_bytes,
         device=args.device,
+        use_gemini_agent=args.use_gemini_agent,
+        gemini_model=args.gemini_model,
     )
     uvicorn.run(
         app,
