@@ -2,33 +2,18 @@
  * Integration tests that actually run the JAR (slow)
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { convert } from '../src/index';
-import * as path from 'path';
 import * as fs from 'fs';
-import { fileURLToPath } from 'url';
+import * as path from 'path';
+import { getIntegrationPaths } from './helpers/integrationPaths';
+import { useTempDirLifecycle } from './helpers/tempDirLifecycle';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const { inputPdf, tempDir } = getIntegrationPaths(import.meta.url, 'convert');
 
-const rootDir = path.resolve(__dirname, '..', '..', '..');
-const inputPdf = path.join(rootDir, 'samples', 'pdf', '1901.03003.pdf');
-const tempDir = path.join(__dirname, 'temp', 'convert');
+useTempDirLifecycle(tempDir);
 
 describe('convert() integration', () => {
-  beforeAll(() => {
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-    fs.mkdirSync(tempDir, { recursive: true });
-  });
-
-  afterAll(() => {
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
   it('should generate output file', async () => {
     await convert(inputPdf, {
       outputDir: tempDir,

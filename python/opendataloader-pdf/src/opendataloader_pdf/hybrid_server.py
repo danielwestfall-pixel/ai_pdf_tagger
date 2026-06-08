@@ -527,7 +527,7 @@ def create_app(
     max_file_size: int = MAX_FILE_SIZE,
     device: str = "auto",
     use_gemini_agent: bool = False,
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = "gemini-2.0-flash",
 ):
     """Create and configure the FastAPI application.
 
@@ -546,7 +546,7 @@ def create_app(
         gemini_model: Gemini model name for the agent.
     """
     from fastapi import FastAPI, File, Form, UploadFile, Request, BackgroundTasks
-    from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+    from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, FileResponse
     from pathlib import Path
     import uuid
     import subprocess
@@ -561,7 +561,11 @@ def create_app(
 
     def get_docling_converter():
         nonlocal _docling_converter
+        global converter
         with _converter_lock:
+            if converter is not None:
+                _docling_converter = converter
+                return _docling_converter
             if _docling_converter is None:
                 logger.info("Initializing Docling DocumentConverter...")
                 _docling_converter = create_converter(
@@ -721,6 +725,7 @@ def create_app(
     async def get_config():
         return {
             "default_model": gemini_model,
+            "default_workers": 1,
             "has_key": bool(os.environ.get("GEMINI_API_KEY")),
             "current_mode_agent": use_gemini_agent
         }
@@ -730,6 +735,7 @@ def create_app(
         input_path: str,
         engine: str,
         model: str,
+        workers: int,
         page_ranges: Optional[str],
         host_url: str,
         custom_api_key: Optional[str],
@@ -752,7 +758,12 @@ def create_app(
 
                 # 1. Run Gemini converter to audit layout and write form fields
                 from opendataloader_pdf.agent import GeminiAgentConverter
-                converter_instance = GeminiAgentConverter(api_key=custom_api_key, model_name=model)
+                converter_instance = GeminiAgentConverter(
+                    api_key=custom_api_key,
+                    model_name=model,
+                    max_workers=workers,
+                    should_cancel=lambda: tasks[task_id].get("cancel", False),
+                )
 
                 page_range_tuple = None
                 if page_ranges:
@@ -779,6 +790,8 @@ def create_app(
                 agent_logger.addHandler(handler)
 
                 def progress_cb(completed, total):
+                    if tasks[task_id]["cancel"]:
+                        raise RuntimeError("User cancelled the task")
                     page_progress = 25 + int((completed / total) * 43)
                     tasks[task_id]["progress"] = page_progress
                     tasks[task_id]["logs"].append(f"INFO - Page progress: {completed} of {total} completed.")
@@ -838,6 +851,12 @@ def create_app(
 
             tasks[task_id]["logs"].append(f"INFO - Executing subprocess: {' '.join(cmd)}")
 
+            # Check for cancellation before starting subprocess
+            if tasks[task_id]["cancel"]:
+                tasks[task_id]["logs"].append("[CANCELLED] Task cancelled before Java subprocess")
+                tasks[task_id]["status"] = "cancelled"
+                return
+
             sub_env = os.environ.copy()
             if custom_api_key:
                 sub_env["GEMINI_API_KEY"] = custom_api_key
@@ -869,6 +888,17 @@ def create_app(
                         tasks[task_id]["progress"] = 85
                     elif "Successfully generated tagged PDF" in line_str:
                         tasks[task_id]["progress"] = 95
+                
+                # Check for cancellation during subprocess
+                if tasks[task_id]["cancel"]:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    tasks[task_id]["logs"].append("[CANCELLED] Task cancelled during Java subprocess")
+                    tasks[task_id]["status"] = "cancelled"
+                    return
 
             return_code = process.wait()
 
@@ -919,13 +949,25 @@ def create_app(
         request: Request,
         file: UploadFile = File(...),
         engine: str = Form("gemini"),
-        model: str = Form("gemini-2.5-flash"),
+        model: str = Form("gemini-2.0-flash"),
         pages: Optional[str] = Form(default=None),
+        page_ranges: Optional[str] = Form(default=None),
         api_key: Optional[str] = Form(default=None),
+        custom_api_key: Optional[str] = Form(default=None),
+        workers: Optional[str] = Form(default=None),
         language: Optional[str] = Form(default=None),
         title: Optional[str] = Form(default=None),
         enrich_picture_description: Optional[str] = Form(default=None)
     ):
+        effective_pages = page_ranges if page_ranges else pages
+        effective_api_key = custom_api_key if custom_api_key else api_key
+        try:
+            effective_workers = int(workers) if workers else 3
+        except ValueError:
+            effective_workers = 3
+        # Keep workers in a safe range to avoid overloading Gemini or local CPU.
+        effective_workers = max(1, min(effective_workers, 12))
+
         task_id = f"tag_{uuid.uuid4().hex[:8]}"
         web_work_dir = Path(tempfile.gettempdir()) / "opendataloader_web"
         web_work_dir.mkdir(parents=True, exist_ok=True)
@@ -948,7 +990,8 @@ def create_app(
             "error": None,
             "output_file": None,
             "layout_json": None,
-            "original_filename": file.filename
+            "original_filename": file.filename,
+            "cancel": False
         }
         
         # Get base URL of current server (e.g. http://127.0.0.1:5002)
@@ -965,9 +1008,10 @@ def create_app(
             input_path=str(input_path),
             engine=engine,
             model=model,
-            page_ranges=pages,
+            workers=effective_workers,
+            page_ranges=effective_pages,
             host_url=base_url,
-            custom_api_key=api_key,
+            custom_api_key=effective_api_key,
             language=language,
             title=title,
             enrich_picture_description=(enrich_picture_description == "true")
@@ -990,6 +1034,22 @@ def create_app(
             "error": task["error"],
             "output_url": f"/v1/agent/tasks/{task_id}/download" if task["status"] == "completed" else None
         }
+
+    @app.post("/v1/agent/tasks/{task_id}/cancel")
+    async def cancel_task(task_id: str):
+        if task_id not in tasks:
+            return JSONResponse({"detail": "Task not found"}, status_code=404)
+        
+        task = tasks[task_id]
+        if task["status"] == "completed":
+            return JSONResponse({"detail": "Task already completed"}, status_code=400)
+        
+        # Mark task for cancellation
+        tasks[task_id]["cancel"] = True
+        tasks[task_id]["status"] = "cancelled"
+        tasks[task_id]["logs"].append("[CANCELLED] User requested task cancellation")
+        
+        return {"status": "cancelled", "task_id": task_id}
 
     @app.get("/v1/agent/tasks/{task_id}/download")
     async def download_task_output(task_id: str):
@@ -1034,6 +1094,409 @@ def create_app(
             "errors": [],
             "failed_pages": []
         })
+
+    @app.post("/v1/agent/deduplicate-fields")
+    async def deduplicate_fields(fields_data: dict):
+        """Standalone endpoint to deduplicate and enrich form fields.
+        
+        Expected input:
+        {
+            "form_fields": [
+                {
+                    "page_no": 1,
+                    "name": "email",
+                    "type": "text",
+                    "bbox": [0, 0, 10, 10],
+                    "tooltip": "Email address"
+                }
+            ]
+        }
+        
+        Returns deduplicated, split, and enriched fields.
+        """
+        try:
+            form_fields = fields_data.get("form_fields", [])
+            if not form_fields:
+                return JSONResponse({"detail": "No form fields provided"}, status_code=400)
+            
+            # Ensure each field has required fields
+            for field in form_fields:
+                field.setdefault("page_no", 1)
+                field.setdefault("type", "text")
+                field.setdefault("bbox", [0, 0, 10, 10])
+                field.setdefault("tooltip", "")
+                field.setdefault("original_name", field.get("name", ""))
+                field.setdefault("original_tooltip", field.get("tooltip", ""))
+                field.setdefault("nearby_text", [])
+            
+            # Create a minimal converter instance for processing
+            from opendataloader_pdf.agent import GeminiAgentConverter
+            converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+            
+            # Apply post-processing
+            deduplicated = converter._deduplicate_form_field_names(form_fields)
+            split_groups = converter._split_multipage_radio_groups(deduplicated)
+            enriched = converter._enrich_form_fields_with_text(split_groups, {})  # Empty text dict for standalone
+            
+            return JSONResponse({
+                "status": "success",
+                "form_fields": enriched,
+                "summary": {
+                    "total_fields": len(enriched),
+                    "deduplication_applied": any(f.get("new_name") != f.get("name") for f in enriched),
+                    "multipage_splits": converter._count_multipage_radio_split_groups(enriched)
+                }
+            })
+        except Exception as e:
+            logger.error(f"Error in deduplicate-fields: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    @app.post("/v1/agent/extract-form-fields")
+    async def extract_form_fields(file: UploadFile = File(...)):
+        """Extract form fields from a PDF without running Gemini tagging.
+        
+        Accepts: PDF file upload
+        Returns: List of form fields with type, name, tooltip, and surrounding text
+        """
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                return JSONResponse({"detail": "File must be a PDF"}, status_code=400)
+            
+            # Save uploaded file temporarily
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                content = await file.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+            
+            try:
+                # Extract form fields
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+                result = converter.extract_form_fields_only(tmp_path)
+                
+                return JSONResponse(result)
+            finally:
+                # Clean up temp file
+                import os
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception as e:
+                        logger.warning(f"Could not delete temp file {tmp_path}: {e}")
+        
+        except Exception as e:
+            logger.error(f"Error extracting form fields: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    @app.post("/v1/agent/detect-missing-form-fields")
+    async def detect_missing_form_fields(
+        file: UploadFile = File(...),
+        page_ranges: Optional[str] = Form(default=None),
+        api_key: Optional[str] = Form(default=None),
+    ):
+        """Visually detect missing form fields that should be added before tagging."""
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                return JSONResponse({"detail": "File must be a PDF"}, status_code=400)
+
+            import tempfile
+            import os
+
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                content = await file.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            try:
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter = GeminiAgentConverter(
+                    api_key=api_key or os.environ.get("GEMINI_API_KEY"),
+                    model_name="gemini-2.0-flash",
+                    max_workers=1,
+                )
+                page_range_tuple = None
+                if page_ranges:
+                    start_s, end_s = page_ranges.split("-", 1) if "-" in page_ranges else (page_ranges, page_ranges)
+                    page_range_tuple = (max(0, int(start_s) - 1), max(0, int(end_s) - 1))
+                result = converter.detect_missing_form_fields(tmp_path, page_range=page_range_tuple)
+                return JSONResponse(result)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception as e:
+                        logger.warning(f"Could not delete temp file {tmp_path}: {e}")
+        except Exception as e:
+            logger.error(f"Error detecting missing form fields: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    @app.post("/v1/agent/add-form-fields")
+    async def add_form_fields(
+        file: UploadFile = File(...),
+        fields_json: str = Form(...),
+    ):
+        """Add approved detected form fields to a PDF and return the modified PDF."""
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                return JSONResponse({"detail": "File must be a PDF"}, status_code=400)
+
+            import tempfile
+            import os
+            import json
+
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_input:
+                content = await file.read()
+                tmp_input.write(content)
+                tmp_input_path = tmp_input.name
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_output:
+                tmp_output_path = tmp_output.name
+
+            try:
+                provided = json.loads(fields_json)
+                form_fields = provided.get("form_fields", provided) if isinstance(provided, dict) else provided
+                if not isinstance(form_fields, list):
+                    return JSONResponse({"detail": "fields_json must contain a form_fields array"}, status_code=400)
+
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+                result = converter.add_form_fields_to_pdf(tmp_input_path, form_fields, tmp_output_path)
+
+                with open(tmp_output_path, 'rb') as f:
+                    pdf_content = f.read()
+
+                output_filename = file.filename.replace('.pdf', '_with_fields.pdf')
+                return StreamingResponse(
+                    iter([pdf_content]),
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{output_filename}"',
+                        "X-Fields-Added": str(result.get("fields_added", 0)),
+                        "X-Fields-Skipped": str(result.get("fields_skipped", 0)),
+                    },
+                )
+            finally:
+                for path in [tmp_input_path, tmp_output_path]:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception as e:
+                            logger.warning(f"Could not delete temp file {path}: {e}")
+        except Exception as e:
+            logger.error(f"Error adding form fields: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    @app.post("/v1/agent/apply-and-save-fields")
+    async def apply_and_save_fields(
+        file: UploadFile = File(...),
+        enriched_json: Optional[str] = Form(default=None)
+    ):
+        """Extract form fields from PDF, apply enrichment/deduplication, and save as new PDF.
+        
+        Accepts: 
+            - file: PDF file upload
+            - enriched_json: Optional pre-computed enriched fields JSON string
+        
+        Returns: 
+            - Modified PDF file for download
+        """
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                return JSONResponse({"detail": "File must be a PDF"}, status_code=400)
+            
+            # Save uploaded file temporarily
+            import tempfile
+            import os
+            
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_input:
+                content = await file.read()
+                tmp_input.write(content)
+                tmp_input_path = tmp_input.name
+            
+            # Create output temp file path
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_output:
+                tmp_output_path = tmp_output.name
+            
+            try:
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+                
+                # Extract form fields
+                result = converter.extract_form_fields_only(tmp_input_path)
+                enriched_fields = result["form_fields"]
+                
+                # If enriched_json was provided, use that instead
+                if enriched_json:
+                    try:
+                        import json
+                        provided = json.loads(enriched_json)
+                        if isinstance(provided, dict) and "form_fields" in provided:
+                            enriched_fields = provided["form_fields"]
+                        elif isinstance(provided, list):
+                            enriched_fields = provided
+                    except Exception as e:
+                        logger.warning(f"Could not parse provided enriched_json: {e}, using extracted fields")
+                
+                # Apply enriched fields to PDF and save
+                update_result = converter.update_pdf_with_enriched_fields(
+                    tmp_input_path, 
+                    enriched_fields, 
+                    tmp_output_path
+                )
+                
+                # Read the modified PDF for response
+                with open(tmp_output_path, 'rb') as f:
+                    pdf_content = f.read()
+                
+                # Return the modified PDF as downloadable file
+                original_filename = file.filename
+                output_filename = original_filename.replace('.pdf', '_updated.pdf')
+                
+                return StreamingResponse(
+                    iter([pdf_content]),
+                    media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{output_filename}"'}
+                )
+            finally:
+                # Clean up temp files
+                for path in [tmp_input_path, tmp_output_path]:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception as e:
+                            logger.warning(f"Could not delete temp file {path}: {e}")
+        
+        except Exception as e:
+            logger.error(f"Error applying and saving fields: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    # Semantic Tag Conversion Endpoints
+    @app.post("/v1/agent/extract-tags")
+    async def extract_tags(file: UploadFile = File(...)):
+        """Extract all tags from PDF for semantic conversion."""
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                return JSONResponse({"detail": "File must be a PDF"}, status_code=400)
+            
+            import tempfile
+            import os
+            
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_input:
+                content = await file.read()
+                tmp_input.write(content)
+                tmp_input_path = tmp_input.name
+            
+            try:
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+                
+                # Extract tags
+                result = converter.extract_tags_from_pdf(tmp_input_path)
+                
+                return JSONResponse(result)
+            finally:
+                if os.path.exists(tmp_input_path):
+                    try:
+                        os.remove(tmp_input_path)
+                    except Exception as e:
+                        logger.warning(f"Could not delete temp file: {e}")
+        
+        except Exception as e:
+            logger.error(f"Error extracting tags: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    @app.post("/v1/agent/suggest-tags")
+    async def suggest_tags(tags_data: dict):
+        """Suggest semantic tags based on content analysis."""
+        try:
+            tags_with_content = tags_data.get("tags", [])
+            
+            from opendataloader_pdf.agent import GeminiAgentConverter
+            converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+            
+            # Suggest semantic tags
+            result = converter.suggest_semantic_tags(tags_with_content)
+            
+            return JSONResponse(result)
+        
+        except Exception as e:
+            logger.error(f"Error suggesting tags: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
+
+    @app.post("/v1/agent/apply-tags")
+    async def apply_tags(
+        file: UploadFile = File(...),
+        tag_mappings: str = Form(...),
+        restructure_document: str = Form("false"),
+    ):
+        """Apply semantic tag mappings to PDF."""
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                return JSONResponse({"detail": "File must be a PDF"}, status_code=400)
+            
+            import tempfile
+            import os
+            import json
+            
+            # Parse tag mappings
+            mappings = json.loads(tag_mappings)
+            
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_input:
+                content = await file.read()
+                tmp_input.write(content)
+                tmp_input_path = tmp_input.name
+            
+            # Create output temp file path
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_output:
+                tmp_output_path = tmp_output.name
+            
+            try:
+                from opendataloader_pdf.agent import GeminiAgentConverter
+                converter = GeminiAgentConverter(api_key="dummy", model_name="gemini-2.0-flash", max_workers=1)
+                
+                # Apply tag mappings
+                result = converter.apply_semantic_tags(
+                    tmp_input_path,
+                    mappings,
+                    tmp_output_path,
+                    restructure_document=restructure_document.lower() in {"1", "true", "yes", "on"},
+                )
+                
+                # Read the modified PDF for response
+                with open(tmp_output_path, 'rb') as f:
+                    pdf_content = f.read()
+                
+                # Return the modified PDF as downloadable file
+                original_filename = file.filename
+                output_filename = original_filename.replace('.pdf', '_tagged.pdf')
+                
+                return StreamingResponse(
+                    iter([pdf_content]),
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{output_filename}"',
+                        "X-Applied-Count": str(result.get("applied_count", 0)),
+                        "X-Mapping-Count": str(len(mappings)),
+                        "X-Document-Structured": str(result.get("document_structured", False)).lower(),
+                        "X-Page-Containers": str(result.get("page_containers", 0)),
+                        "X-Form-Fields-Tagged": str(result.get("form_fields_tagged", 0)),
+                        "X-Rejected-Mapping-Count": str(len(result.get("rejected_mappings", {}))),
+                    }
+                )
+            finally:
+                # Clean up temp files
+                for path in [tmp_input_path, tmp_output_path]:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception as e:
+                            logger.warning(f"Could not delete temp file {path}: {e}")
+        
+        except Exception as e:
+            logger.error(f"Error applying tags: {e}", exc_info=True)
+            return JSONResponse({"detail": str(e)}, status_code=500)
 
     # Standard endpoints
     @app.get("/health")
@@ -1384,8 +1847,8 @@ def main():
     parser.add_argument(
         "--gemini-model",
         type=str,
-        default="gemini-2.5-flash",
-        help="Gemini model name to use for the visual tagger agent. Default: gemini-2.5-flash.",
+        default="gemini-2.0-flash",
+        help="Gemini model name to use for the visual tagger agent. Default: gemini-2.0-flash.",
     )
     args = parser.parse_args()
 

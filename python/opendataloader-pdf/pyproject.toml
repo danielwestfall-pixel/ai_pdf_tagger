@@ -20,6 +20,10 @@ hybrid = [
     "fastapi>=0.136.1",
     "uvicorn>=0.46.0",
     "python-multipart>=0.0.28",
+    "pymupdf>=1.24.0",
+    "pikepdf>=9.0.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]

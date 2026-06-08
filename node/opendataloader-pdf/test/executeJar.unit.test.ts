@@ -45,7 +45,7 @@ function makeFakeSpawn(): {
 /** Yield to the microtask queue so Promise callbacks fire. */
 const tick = () => new Promise<void>((r) => setImmediate(r));
 
-describe('executeJar — library API (convert)', () => {
+function useProcessIoSpies() {
   let stdoutSpy: ReturnType<typeof vi.spyOn>;
   let stderrSpy: ReturnType<typeof vi.spyOn>;
 
@@ -59,6 +59,19 @@ describe('executeJar — library API (convert)', () => {
     stderrSpy.mockRestore();
     vi.clearAllMocks();
   });
+
+  return {
+    get stdout() {
+      return stdoutSpy;
+    },
+    get stderr() {
+      return stderrSpy;
+    },
+  };
+}
+
+describe('executeJar — library API (convert)', () => {
+  const io = useProcessIoSpies();
 
   it('returns the full stdout string on success', async () => {
     const { proc } = makeFakeSpawn();
@@ -80,7 +93,7 @@ describe('executeJar — library API (convert)', () => {
 
     await promise;
 
-    expect(stdoutSpy).not.toHaveBeenCalled();
+    expect(io.stdout).not.toHaveBeenCalled();
   });
 
   it('does not write to process.stderr (no streaming side-effect)', async () => {
@@ -96,7 +109,7 @@ describe('executeJar — library API (convert)', () => {
 
     await promise;
 
-    expect(stderrSpy).not.toHaveBeenCalled();
+    expect(io.stderr).not.toHaveBeenCalled();
   });
 
   it('rejects with stderr in the error message on non-zero exit', async () => {
@@ -142,19 +155,7 @@ describe('executeJar — library API (convert)', () => {
 });
 
 describe('executeJar — CLI helper (_runForCli)', () => {
-  let stdoutSpy: ReturnType<typeof vi.spyOn>;
-  let stderrSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-  });
-
-  afterEach(() => {
-    stdoutSpy.mockRestore();
-    stderrSpy.mockRestore();
-    vi.clearAllMocks();
-  });
+  const io = useProcessIoSpies();
 
   it('streams stdout chunks to process.stdout in real time', async () => {
     // The defining requirement for hybrid-mode-style long runs: the user must
@@ -164,19 +165,19 @@ describe('executeJar — CLI helper (_runForCli)', () => {
 
     proc.stdout.emit('data', Buffer.from('chunk1'));
     await tick();
-    expect(stdoutSpy).toHaveBeenCalledWith('chunk1');
-    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(io.stdout).toHaveBeenCalledWith('chunk1');
+    expect(io.stdout).toHaveBeenCalledTimes(1);
 
     proc.stdout.emit('data', Buffer.from('chunk2'));
     await tick();
-    expect(stdoutSpy).toHaveBeenCalledTimes(2);
+    expect(io.stdout).toHaveBeenCalledTimes(2);
 
     proc.emit('close', 0);
     await promise;
 
     // Critical: process.stdout was called exactly twice — once per chunk.
     // No extra "final flush" call. That's how we avoid the #398 double-write.
-    expect(stdoutSpy).toHaveBeenCalledTimes(2);
+    expect(io.stdout).toHaveBeenCalledTimes(2);
   });
 
   it('streams stderr chunks to process.stderr in real time', async () => {
@@ -185,11 +186,11 @@ describe('executeJar — CLI helper (_runForCli)', () => {
 
     proc.stderr.emit('data', Buffer.from('정보: Number of pages: 14\n'));
     await tick();
-    expect(stderrSpy).toHaveBeenCalledWith('정보: Number of pages: 14\n');
+    expect(io.stderr).toHaveBeenCalledWith('정보: Number of pages: 14\n');
 
     proc.stderr.emit('data', Buffer.from('정보: Processing 14 pages\n'));
     await tick();
-    expect(stderrSpy).toHaveBeenCalledTimes(2);
+    expect(io.stderr).toHaveBeenCalledTimes(2);
 
     proc.emit('close', 0);
     await promise;
@@ -203,11 +204,11 @@ describe('executeJar — CLI helper (_runForCli)', () => {
     const promise = _runForCli(['input.pdf']);
 
     const calls: string[] = [];
-    stdoutSpy.mockImplementation(((chunk: Buffer) => {
+    io.stdout.mockImplementation(((chunk: Buffer) => {
       calls.push('OUT:' + chunk.toString());
       return true;
     }) as never);
-    stderrSpy.mockImplementation(((chunk: Buffer) => {
+    io.stderr.mockImplementation(((chunk: Buffer) => {
       calls.push('ERR:' + chunk.toString());
       return true;
     }) as never);
@@ -265,7 +266,7 @@ describe('executeJar — CLI helper (_runForCli)', () => {
     const promise = _runForCli(['input.pdf']);
 
     const forwarded: string[] = [];
-    stderrSpy.mockImplementation(((chunk: string) => {
+    io.stderr.mockImplementation(((chunk: string) => {
       forwarded.push(chunk);
       return true;
     }) as never);

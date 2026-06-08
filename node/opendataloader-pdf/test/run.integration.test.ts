@@ -1,32 +1,15 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { run, convert } from '../src/index';
 import * as path from 'path';
 import * as fs from 'fs';
-import { fileURLToPath } from 'url';
+import { getIntegrationPaths } from './helpers/integrationPaths';
+import { useTempDirLifecycle } from './helpers/tempDirLifecycle';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const { inputPdf, tempDir } = getIntegrationPaths(import.meta.url, 'run');
 
-const rootDir = path.resolve(__dirname, '..', '..', '..');
-const inputPdf = path.join(rootDir, 'samples', 'pdf', '1901.03003.pdf');
-const tempDir = path.join(__dirname, 'temp', 'run');
+useTempDirLifecycle(tempDir);
 
 describe('opendataloader-pdf', () => {
-  beforeAll(() => {
-    // Clean up previous test runs
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-    fs.mkdirSync(tempDir, { recursive: true });
-  });
-
-  afterAll(() => {
-    // Clean up after tests
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
   it('should process PDF and generate markdown output', async () => {
     console.log(`[TEST] Running opendataloader-pdf test...`);
     console.log(`[TEST] Input PDF: ${inputPdf}`);
